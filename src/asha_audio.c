@@ -95,6 +95,38 @@ uint32_t asha_audio_get_write_index()
     return wi;
 }
 
+static atomic_uint usb_stat_underruns = 0u;
+static atomic_uint usb_stat_fifo_min = 0xFFFFu;
+static atomic_uint usb_stat_fifo_max = 0u;
+static atomic_uint usb_stat_late_max_us = 0u;
+
+void asha_usb_stats_note(uint32_t fifo_frames, int underrun, uint32_t late_us)
+{
+    if (underrun) { atomic_fetch_add(&usb_stat_underruns, 1u); }
+    if (fifo_frames < atomic_load(&usb_stat_fifo_min)) { atomic_store(&usb_stat_fifo_min, fifo_frames); }
+    if (fifo_frames > atomic_load(&usb_stat_fifo_max)) { atomic_store(&usb_stat_fifo_max, fifo_frames); }
+    if (late_us > atomic_load(&usb_stat_late_max_us)) { atomic_store(&usb_stat_late_max_us, late_us); }
+}
+
+static atomic_uint usb_stat_peak = 0u;
+void asha_usb_stats_note_peak(uint32_t peak)
+{
+    if (peak > atomic_load(&usb_stat_peak)) { atomic_store(&usb_stat_peak, peak); }
+}
+uint32_t asha_usb_stats_take_peak(void) { return atomic_exchange(&usb_stat_peak, 0u); }
+
+static atomic_uint usb_stat_rate_hz = 0u;
+void asha_usb_stats_set_rate(uint32_t rate_hz) { atomic_store(&usb_stat_rate_hz, rate_hz); }
+uint32_t asha_usb_stats_get_rate(void) { return atomic_load(&usb_stat_rate_hz); }
+
+void asha_usb_stats_take(uint32_t* underruns, uint32_t* fifo_min, uint32_t* fifo_max, uint32_t* late_max_us)
+{
+    *underruns = atomic_exchange(&usb_stat_underruns, 0u);
+    *fifo_min = atomic_exchange(&usb_stat_fifo_min, 0xFFFFu);
+    *fifo_max = atomic_exchange(&usb_stat_fifo_max, 0u);
+    *late_max_us = atomic_exchange(&usb_stat_late_max_us, 0u);
+}
+
 void asha_audio_encode_1ms_pcm(struct PCMStereoSample *samples, uint16_t count)
 {
 #ifdef PICO_ASHA_ENC_STATS
@@ -178,6 +210,36 @@ void asha_audio_encode_1ms_pcm(struct PCMStereoSample *samples, uint16_t count)
         enc_time_index = 0;
     }
 }
+
+#ifdef PICO_ASHA_REPLAY
+// Diagnostic: instead of encoding PCM, fill the SDU ring from G.722 packets recorded
+// from a phone. Same SDU layout, same 1 ms tick, so everything downstream is unchanged.
+extern const uint32_t replay_count;
+extern const uint8_t replay_l[];
+extern const uint8_t replay_r[];
+static uint32_t replay_pos = 0u;
+static unsigned int replay_ticks = 0u;
+
+void asha_audio_replay_1ms(void)
+{
+    if (atomic_exchange(&stream_reset_pending, false)) {
+        reset_stream_encoder();
+        replay_ticks = 0u;
+        replay_pos = 0u;
+    }
+    if (!encode_audio) return;
+    if (++replay_ticks < 20u) return;   // 20 ticks of 1 ms = one SDU
+    replay_ticks = 0u;
+    struct AshaAudioEncBuffer* buff = &enc_ring_buff[ring_buff_index(write_index)];
+    memcpy(buff->l + 1, &replay_l[replay_pos * ASHA_G722_20MS_SIZE_BYTES], ASHA_G722_20MS_SIZE_BYTES);
+    memcpy(buff->r + 1, &replay_r[replay_pos * ASHA_G722_20MS_SIZE_BYTES], ASHA_G722_20MS_SIZE_BYTES);
+    buff->l[0] = seq_num;
+    buff->r[0] = seq_num;
+    ++seq_num;
+    if (++replay_pos >= replay_count) { replay_pos = 0u; }
+    write_index += 1;
+}
+#endif
 
 uint8_t* asha_audio_get_encoded_at_index(enum AshaAudioSide side, uint32_t index)
 {

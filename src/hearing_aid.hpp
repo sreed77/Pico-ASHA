@@ -155,6 +155,8 @@ struct HearingAid
     static void on_connected(bd_addr_t addr, hci_con_handle_t handle);
     static void on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_t reason);
     static void on_data_len_set(hci_con_handle_t handle, uint16_t rx_octets, uint16_t rx_time, uint16_t tx_octets, uint16_t tx_time);
+    // Diagnostics: the controller reports that `count` packets to this connection were acknowledged by the aid
+    static void on_acl_completed(hci_con_handle_t handle, uint16_t count);
     static void delete_pair();
     static void delete_pair(uint16_t conn_id);
     static void handle_sm(PACKET_HANDLER_PARAMS);
@@ -252,6 +254,18 @@ private:
     uint32_t audio_sdu_gap_ticks = 0U;
     uint32_t l2cap_close_ticks = 0U;
 
+    // Per-second link statistics, reported to the host as a ShortLog so that
+    // audible dropouts can be located without manual marking.
+    uint32_t st_sent = 0U;            // SDUs completed this window
+    uint32_t st_gap_max_ms = 0U;      // longest gap between completed SDUs
+    uint32_t st_lat_max_ms = 0U;      // longest request-to-completed time
+    uint32_t st_last_sent_ms = 0U;    // time of previous completion
+    uint32_t st_req_ms = 0U;          // time of last send request
+    uint16_t st_credit_min = 0xFFFFU; // lowest credit count seen
+    uint32_t st_ack_count = 0U;       // packets the aid acknowledged this window
+    uint32_t st_ack_gap_max_ms = 0U;  // longest time between acknowledgements
+    uint32_t st_ack_last_ms = 0U;     // time of the previous acknowledgement
+
     bool stop_request_from_other = false;
 
     std::array<uint8_t, ASHA_SDU_SIZE_BYTES> recv_buff = {};
@@ -282,7 +296,12 @@ private:
     void set_data_langth();
     void send_acp_start();
     void send_acp_stop();
-    void send_acp_status(uint8_t status);
+    // Writes ACP "status" (opcode 3). If param >= 0 it is appended as a third byte, as
+    // Android does for "connection parameter updated" (value = interval in 1.25 ms units).
+    uint8_t send_acp_status(uint8_t status, int16_t param = -1);
+    // Android tells each aid the connection interval once, soon after connecting. Do the same.
+    bool need_conn_param_status = true;
+    uint16_t conn_param_ticks = 0U;
     void send_volume(int8_t volume);
     void close_l2cap_for_recovery();
     void disconnect();

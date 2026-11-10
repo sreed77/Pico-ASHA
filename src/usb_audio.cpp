@@ -40,6 +40,13 @@
 #include "asha_audio.h"
 #include "asha_comms.hpp"
 
+#ifdef PICO_ASHA_REPLAY_PCM
+extern "C" {
+extern const uint32_t replay_pcm_frames;
+extern const int16_t replay_pcm[];
+}
+#endif
+
 namespace asha
 {
 
@@ -341,7 +348,13 @@ static bool audio10_get_req_entity(uint8_t rhport, tusb_control_request_t const 
 //--------------------------------------------------------------------+
 
 // List of supported sample rates for UAC2
+#ifdef PICO_ASHA_USB_16K_ONLY
+// Diagnostic: offer only 16 kHz so the host does its own resampling and the
+// Pico's 48 kHz -> 16 kHz decimation filter is never used (USB Audio Class 2).
+const uint32_t sample_rates[] = {16000};
+#else
 const uint32_t sample_rates[] = {16000, 48000};
+#endif
 
 #define N_SAMPLE_RATES TU_ARRAY_SIZE(sample_rates)
 
@@ -600,6 +613,9 @@ static void audio_task()
     return;
   }
 
+  // How late this tick is compared to its schedule (diagnostics)
+  int64_t const late_us = absolute_time_diff_us(next_audio_task_time, get_absolute_time());
+
   // Advance from the prior deadline rather than from now so task timing does
   // not accumulate drift when an iteration starts late.
   next_audio_task_time = delayed_by_us(next_audio_task_time, 1'000);
@@ -612,10 +628,70 @@ static void audio_task()
   uint16_t const samples = samples_per_frame(current_sample_rate);
   uint16_t const frame_bytes = bytes_per_frame(current_sample_rate);
   absolute_time_t const now = get_absolute_time();
+#if defined(PICO_ASHA_TEST_TONE) || defined(PICO_ASHA_REPLAY) || defined(PICO_ASHA_REPLAY_PCM)
+  {
+    // Diagnostic build: ignore the PC's audio completely and stream a steady
+    // 1 kHz tone (one full period per 1 ms frame at 16 kHz). The USB FIFO is
+    // still drained one frame per tick so the USB side behaves normally.
+    static const int16_t tone_1khz[ASHA_PCM_PACKET_SIZE] = {
+        0, 2296, 4243, 5543, 6000, 5543, 4243, 2296,
+        0, -2296, -4243, -5543, -6000, -5543, -4243, -2296 };
+    static PCMStereoSample tone[ASHA_PCM_PACKET_SIZE];
+    static bool tone_ready = false;
+    if (!tone_ready) {
+      for (unsigned i = 0; i < ASHA_PCM_PACKET_SIZE; ++i) { tone[i].left = tone_1khz[i]; tone[i].right = tone_1khz[i]; }
+      tone_ready = true;
+    }
+    if (samples && frame_bytes && tud_audio_available() >= frame_bytes) {
+      tud_audio_read(spk_buf, frame_bytes);
+    }
+    last_pcm_packet_time = now;
+    silence_counter = 0;
+    asha_audio_set_pcm_streaming_enabled(true);
+#if defined(PICO_ASHA_REPLAY)
+    (void)tone;
+    asha_audio_replay_1ms();
+#elif defined(PICO_ASHA_REPLAY_PCM)
+    (void)tone;
+    {
+      // Recorded phone audio, already decoded to 16 kHz stereo PCM, goes through the
+      // Pico's own G.722 encoder exactly as live USB audio would.
+      static uint32_t pcm_frame = 0u;
+      PCMStereoSample frame[ASHA_PCM_PACKET_SIZE];
+      memcpy(frame, &replay_pcm[(size_t)pcm_frame * ASHA_PCM_PACKET_SIZE * 2u], sizeof(frame));
+      if (++pcm_frame >= replay_pcm_frames) { pcm_frame = 0u; }
+      asha_audio_encode_1ms_pcm(frame, ASHA_PCM_PACKET_SIZE);
+    }
+#else
+    asha_audio_encode_1ms_pcm(tone, ASHA_PCM_PACKET_SIZE);
+#endif
+    return;
+  }
+#endif
+  {
+    // Diagnostics: it is an underrun (silence inserted into live audio) when the FIFO
+    // is short of a full frame while audio was flowing within the last second.
+    uint32_t const fifo_frames = frame_bytes ? (uint32_t)(tud_audio_available() / frame_bytes) : 0u;
+    bool const live = absolute_time_diff_us(last_pcm_packet_time, now) < 1'000'000;
+    asha_usb_stats_note(fifo_frames, (live && samples && fifo_frames == 0u) ? 1 : 0,
+                        late_us > 0 ? (uint32_t)late_us : 0u);
+    asha_usb_stats_set_rate(current_sample_rate);
+  }
   if (samples && tud_audio_available() >= frame_bytes) {
     uint16_t const bytes_read = tud_audio_read(spk_buf, frame_bytes);
     if (bytes_read == frame_bytes) {
       last_pcm_packet_time = now;
+      {
+        // Diagnostics: loudest sample in this 1 ms of incoming audio
+        uint32_t peak = 0u;
+        for (uint16_t i = 0; i < samples; ++i) {
+          int32_t const l = spk_buf[i].left < 0 ? -(int32_t)spk_buf[i].left : spk_buf[i].left;
+          int32_t const r = spk_buf[i].right < 0 ? -(int32_t)spk_buf[i].right : spk_buf[i].right;
+          if ((uint32_t)l > peak) { peak = (uint32_t)l; }
+          if ((uint32_t)r > peak) { peak = (uint32_t)r; }
+        }
+        asha_usb_stats_note_peak(peak);
+      }
       if (std::all_of(spk_buf, spk_buf + samples, [](PCMStereoSample s) {return s.left == 0 && s.right == 0; })) {
         if (silence_counter < silence_timeout) {
           ++silence_counter;
@@ -624,6 +700,13 @@ static void audio_task()
         silence_counter = 0;
       }
       asha_audio_set_pcm_streaming_enabled((silence_counter >= silence_timeout) ? false : true);
+#if defined(PICO_ASHA_PCM_ATTEN_SHIFT) && (PICO_ASHA_PCM_ATTEN_SHIFT > 0)
+      // Diagnostic: lower the incoming audio level by 6 dB per shift before encoding
+      for (uint16_t i = 0; i < samples; ++i) {
+        spk_buf[i].left = (int16_t)(spk_buf[i].left >> PICO_ASHA_PCM_ATTEN_SHIFT);
+        spk_buf[i].right = (int16_t)(spk_buf[i].right >> PICO_ASHA_PCM_ATTEN_SHIFT);
+      }
+#endif
       asha_audio_encode_1ms_pcm(spk_buf, samples);
       return;
     }

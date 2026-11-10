@@ -468,13 +468,30 @@ void HearingAid::on_disconnected(hci_con_handle_t handle, uint8_t status, uint8_
     start_scan();
 }
 
-void HearingAid::on_data_len_set(hci_con_handle_t handle, 
-    [[maybe_unused]] uint16_t rx_octets, 
-    [[maybe_unused]] uint16_t rx_time, 
-    [[maybe_unused]] uint16_t tx_octets, 
+void HearingAid::on_acl_completed(hci_con_handle_t handle, uint16_t count)
+{
+    HearingAid* ha = get_by_con_handle(handle);
+    if (!ha || !ha->is_streaming()) { return; }
+    uint32_t const now_ms = btstack_run_loop_get_time_ms();
+    if (ha->st_ack_last_ms != 0U) {
+        uint32_t const gap = now_ms - ha->st_ack_last_ms;
+        if (gap < 3000U && gap > ha->st_ack_gap_max_ms) { ha->st_ack_gap_max_ms = gap; }
+    }
+    ha->st_ack_last_ms = now_ms;
+    ha->st_ack_count += count;
+}
+
+void HearingAid::on_data_len_set(hci_con_handle_t handle,
+    [[maybe_unused]] uint16_t rx_octets,
+    [[maybe_unused]] uint16_t rx_time,
+    [[maybe_unused]] uint16_t tx_octets,
     [[maybe_unused]] uint16_t tx_time)
 {
     HearingAid* ha = get_by_con_handle(handle);
+    if (ha) {
+        comm::short_log(ha->conn_id, "dle tx%u/%u rx%u/%u", (unsigned)(uint16_t)tx_octets, (unsigned)(uint8_t)(tx_time / 100U),
+                  (unsigned)(uint16_t)rx_octets, (unsigned)(uint8_t)(rx_time / 100U));
+    }
 
     // DLE changes are handled asynchronously: the DataLength process state issues
     // the set-data-length command and advances to DiscoverChars itself, rather than
@@ -1019,6 +1036,17 @@ void HearingAid::handle_l2cap_cbm(PACKET_HANDLER_PARAMS)
 #ifdef PICO_ASHA_L2CAP_TX_TRACE
             short_log(ha->conn_id, "%s", "L2CAP Tx sent");
 #endif
+            {
+                uint32_t const now_ms = btstack_run_loop_get_time_ms();
+                uint32_t const lat = now_ms - ha->st_req_ms;
+                if (lat < 3000U && lat > ha->st_lat_max_ms) { ha->st_lat_max_ms = lat; }
+                if (ha->st_last_sent_ms != 0U) {
+                    uint32_t const gap = now_ms - ha->st_last_sent_ms;
+                    if (gap < 3000U && gap > ha->st_gap_max_ms) { ha->st_gap_max_ms = gap; }
+                }
+                ha->st_last_sent_ms = now_ms;
+                ++ha->st_sent;
+            }
             ha->audio_data = nullptr;
             ha->audio_tx_pending_ticks = 0;
             ha->audio_sdu_gap_ticks = 0;
@@ -1187,6 +1215,72 @@ bool HearingAid::process_audio()
     
     bool pcm_is_streaming = asha_audio_get_pcm_streaming_enabled();
 
+    // Once a second, report each streaming aid's link health to the host:
+    // n = SDUs delivered (50 is perfect), g = longest gap between SDUs in ms
+    // (about 20 is perfect), c = lowest credit count (8 is perfect),
+    // l = longest send time in ms. Only sent while a host is listening so it
+    // does not crowd out the stored event history.
+    {
+        static uint32_t st_window_ms = 0U;
+        static uint32_t st_last_tick_ms = 0U;
+        static uint32_t st_tick_max_ms = 0U;   // longest time between two audio ticks (about 1 ms)
+        uint32_t const now_ms = btstack_run_loop_get_time_ms();
+        if (st_last_tick_ms != 0U && (now_ms - st_last_tick_ms) > st_tick_max_ms) {
+            st_tick_max_ms = now_ms - st_last_tick_ms;
+        }
+        st_last_tick_ms = now_ms;
+        if (now_ms - st_window_ms >= 1000U) {
+            st_window_ms = now_ms;
+            // t = longest stall of the Pico's own main loop this second, in ms.
+            // A big t during a dropout means the Pico itself froze, not the radio.
+            uint16_t const stall = (uint16_t)std::min<uint32_t>(st_tick_max_ms, 9999U);
+            st_tick_max_ms = 0U;
+            {
+                // USB side (runs on the other core): u = times silence had to be inserted
+                // because the PC had not delivered the next 1 ms of audio, f = fewest-most
+                // 1 ms frames waiting in the USB buffer, d = worst lateness of the USB task in ms
+                uint32_t u = 0U, fmin = 0U, fmax = 0U, late_us = 0U;
+                asha_usb_stats_take(&u, &fmin, &fmax, &late_us);
+                if (usb_connected() && (hearing_aids[0]->is_streaming() || hearing_aids[1]->is_streaming())) {
+                    // Each value is limited to 0..99 so the line always fits the 32-byte log text.
+                    // p = loudest incoming sample as a percent of full scale (99 = at or near clipping).
+                    uint32_t const peak = asha_usb_stats_take_peak();
+                    unsigned const peak_pct = (unsigned)std::min<uint32_t>(peak * 100U / 32768U, 99U);
+                    short_log(unset_conn_id, "usb u%u f%u-%u d%u r%u p%u",
+                              (unsigned)(std::min<uint32_t>(u, 99U) % 100U),
+                              (unsigned)(std::min<uint32_t>(fmin, 99U) % 100U),
+                              (unsigned)(std::min<uint32_t>(fmax, 99U) % 100U),
+                              (unsigned)(std::min<uint32_t>(late_us / 1000U, 99U) % 100U),
+                              (unsigned)(std::min<uint32_t>(asha_usb_stats_get_rate() / 1000U, 99U) % 100U),
+                              peak_pct % 100U);
+                }
+            }
+            for (auto ha : hearing_aids) {
+                if (ha->is_streaming() && usb_connected()) {
+                    uint8_t const cr = (ha->st_credit_min > 99U) ? 99U : (uint8_t)ha->st_credit_min;
+                    uint16_t const gap = (uint16_t)std::min<uint32_t>(ha->st_gap_max_ms, 9999U);
+                    uint8_t const n = (uint8_t)std::min<uint32_t>(ha->st_sent, 255U);
+                    short_log(ha->conn_id, "%c n%u g%u c%u t%u",
+                              ha->rop.side() == Side::Left ? 'L' : 'R',
+                              (unsigned)n, (unsigned)gap, (unsigned)cr, (unsigned)stall);
+                    // a = packets the aid acknowledged over the air this second (50 is perfect),
+                    // k = longest time between acknowledgements in ms (about 20 is perfect; 40 or
+                    // more means an over-the-air event was missed or retried)
+                    uint8_t const acks = (uint8_t)std::min<uint32_t>(ha->st_ack_count, 255U);
+                    uint16_t const ackgap = (uint16_t)std::min<uint32_t>(ha->st_ack_gap_max_ms, 9999U);
+                    short_log(ha->conn_id, "%c a%u k%u",
+                              ha->rop.side() == Side::Left ? 'L' : 'R', (unsigned)acks, (unsigned)ackgap);
+                }
+                ha->st_ack_count = 0U;
+                ha->st_ack_gap_max_ms = 0U;
+                ha->st_sent = 0U;
+                ha->st_gap_max_ms = 0U;
+                ha->st_lat_max_ms = 0U;
+                ha->st_credit_min = 0xFFFFU;
+            }
+        }
+    }
+
     asha_audio_set_encode_mono(!(hearing_aids[0]->is_streaming() && hearing_aids[1]->is_streaming()));
 
     bool enable_process_delay = false;
@@ -1201,8 +1295,26 @@ bool HearingAid::process_audio()
         }
         if (ha->process_state != ProcessState::Audio) { continue; }
         ha->credits = l2cap_cbm_available_credits(ha->cid);
+        if (ha->is_streaming() && ha->credits < ha->st_credit_min) {
+            ha->st_credit_min = ha->credits;
+        }
         switch (ha->audio_state) {
             case AudioState::Ready:
+                // Android writes "connection parameters updated, interval 16" (03 02 10) to each
+                // aid soon after connecting. The aid uses it to set up its audio buffering, so
+                // do the same once per connection before any stream starts.
+                if (ha->need_conn_param_status) {
+                    // Try every 50 ms, and give up after about 1 s so a failure cannot spam events
+                    if (++ha->conn_param_ticks % 50U == 0U) {
+                        if (ha->send_acp_status(ACPStatus::conn_param_updated, 16) == ERROR_CODE_SUCCESS) {
+                            ha->need_conn_param_status = false;
+                            short_log(ha->conn_id, "%s", "sent ACP conn-param 03 02 10");
+                        } else if (ha->conn_param_ticks >= 1000U) {
+                            ha->need_conn_param_status = false;
+                        }
+                    }
+                    break;
+                }
                 // After a zero-credit stop, wait up to the cooldown window for
                 // credits to fully replenish before restarting; starting at low
                 // credit counts immediately re-drains and produces audible
@@ -1344,6 +1456,7 @@ bool HearingAid::process_audio()
                         short_log(ha->conn_id, "L2CAP Tx req S:%u Cr:%u",
                                   (unsigned)ha->audio_data[0], (unsigned)ha->credits);
 #endif
+                        ha->st_req_ms = btstack_run_loop_get_time_ms();
                         uint8_t const tx_request_status = l2cap_request_can_send_now_event(ha->cid);
                         if (tx_request_status != ERROR_CODE_SUCCESS) {
                             short_log(ha->conn_id, "L2CAP Tx req err: 0x%02X Cr:%u",
@@ -1542,20 +1655,26 @@ void HearingAid::send_acp_stop()
     }
 }
 
-void HearingAid::send_acp_status(uint8_t status)
+uint8_t HearingAid::send_acp_status(uint8_t status, int16_t param)
 {
     using namespace comm;
 
     acp_cmd_packet[0] = ACPOpCode::status;
     acp_cmd_packet[1] = status;
+    uint16_t len = 2u;
+    if (param >= 0) {
+        acp_cmd_packet[2] = (uint8_t)param;
+        len = 3u;
+    }
     auto res = gatt_client_write_value_of_characteristic_without_response(conn_handle,
                                                                           services.asha.acp.value_handle,
-                                                                          2u,
+                                                                          len,
                                                                           acp_cmd_packet.data());
     if (res != ERROR_CODE_SUCCESS) {
         //LOG_ERROR("%s: Updating status via ACP failed with %s", get_side_str(), bt_err_str(res));
         add_event_to_buffer(conn_id, EventPacket(EventType::ACPStatus, StatusType::BtstackStatus, res));
     }
+    return res;
 }
 
 void HearingAid::send_volume(int8_t volume)
@@ -1624,6 +1743,8 @@ void HearingAid::reset()
     credits = 0;
     zero_credits_cooldown = 0;
     ready_stuck_ticks = 0;
+    need_conn_param_status = true;
+    conn_param_ticks = 0U;
     paired_and_bonded = false;
     process_delay_ticks = 0;
     error_count = 0;
